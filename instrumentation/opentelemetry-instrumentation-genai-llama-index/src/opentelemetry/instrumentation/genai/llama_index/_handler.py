@@ -504,8 +504,6 @@ def _set_agent_finish_reason(
     invocation: LocalAgentInvocation, finish_reason: str
 ) -> None:
     invocation.finish_reasons = [finish_reason]
-    for message in invocation.output_messages:
-        message.finish_reason = finish_reason
 
 
 def _set_return_direct_agent_output(
@@ -766,7 +764,7 @@ class _LlamaIndexInvocation(BaseSpan):
     def set_pending_handoff(
         self, run_id: str, invocation: LocalAgentInvocation
     ) -> None:
-        """Hold a handing-off agent open until its whole turn has drained."""
+        """Remember an apparent handoff until a later agent step confirms it."""
         self._workflow_pending_handoffs[run_id] = invocation
 
     def take_pending_handoff(self, run_id: str) -> LocalAgentInvocation | None:
@@ -816,6 +814,7 @@ class _LlamaIndexInvocation(BaseSpan):
             _finish_member_agent(agent_invocation, error)
         self._workflow_invocations_by_key.clear()
         self._workflow_invocations_by_run_id.clear()
+        self._workflow_pending_handoffs.clear()
 
 
 class LlamaIndexSpanHandler(BaseSpanHandler[_LlamaIndexInvocation]):
@@ -951,6 +950,23 @@ class LlamaIndexSpanHandler(BaseSpanHandler[_LlamaIndexInvocation]):
                 if parent is not None
                 else None
             )
+            pending_handoff = (
+                parent.take_pending_handoff(workflow_run_id)
+                if parent is not None and workflow_run_id is not None
+                else None
+            )
+            if (
+                pending_handoff is not None
+                and pending_handoff is not workflow_agent_invocation
+            ):
+                # A handoff is only complete once AgentWorkflow starts the
+                # destination agent. The same agent can continue after a
+                # rejected handoff, and another return-direct tool can end the
+                # workflow before the destination runs.
+                _set_agent_finish_reason(pending_handoff, "tool_calls")
+                _finish_member_agent(pending_handoff, None)
+                if parent is not None:
+                    parent.remove_workflow_invocation(pending_handoff)
             member_agent_step = True
             if workflow_agent_invocation is None:
                 workflow_agent_invocation = _start_member_agent(
@@ -1133,12 +1149,10 @@ class LlamaIndexSpanHandler(BaseSpanHandler[_LlamaIndexInvocation]):
         handoff_succeeded: bool = True,
         error: BaseException | None = None,
     ) -> None:
-        """Release one tool of a member agent's turn and close the agent last.
+        """Release one tool result and defer successful handoffs.
 
-        AgentWorkflow reports a handoff as a tool call made by the agent that is
-        stepping down, and that turn can request other tools alongside it. The
-        agent's span has to outlive every one of them, so it is closed only once
-        the turn's last tool call ends.
+        A later agent step confirms whether control transferred; rejected
+        handoffs and sibling return-direct results can keep the current agent.
         """
         run_id = span._workflow_run_id
         if run_id is None:
@@ -1157,15 +1171,12 @@ class LlamaIndexSpanHandler(BaseSpanHandler[_LlamaIndexInvocation]):
             parent.set_pending_handoff(run_id, invocation)
         if not parent.release_workflow_tool(run_id):
             return
-        pending = parent.take_pending_handoff(run_id)
-        if pending is not None:
-            turn_error = parent.take_workflow_tool_error(run_id)
-            if turn_error is None:
-                _set_agent_finish_reason(pending, "tool_calls")
-            _finish_member_agent(pending, turn_error)
-            parent.remove_workflow_invocation(pending)
-        else:
-            parent.take_workflow_tool_error(run_id)
+        turn_error = parent.take_workflow_tool_error(run_id)
+        if turn_error is not None:
+            pending = parent.take_pending_handoff(run_id)
+            if pending is not None:
+                _finish_member_agent(pending, turn_error)
+                parent.remove_workflow_invocation(pending)
 
     def prepare_to_exit_span(
         self,

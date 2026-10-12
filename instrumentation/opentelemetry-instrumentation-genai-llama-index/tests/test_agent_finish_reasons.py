@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Iterator, Sequence
 from typing import Any
 
+import llama_index.core.agent.workflow.multi_agent_workflow as multi_agent_workflow
 import pytest
 from llama_index.core.agent.workflow import (
     AgentWorkflow,
@@ -128,11 +130,11 @@ def _assert_finish_reason(
     assert all(isinstance(reason, str) for reason in reasons)
     assert span.status.status_code == StatusCode.UNSET
     if capture_content:
+        assert GenAIAttributes.GEN_AI_OUTPUT_MESSAGES in attributes
         messages = json.loads(
             attributes[GenAIAttributes.GEN_AI_OUTPUT_MESSAGES]
         )
         assert len(messages) == 1
-        assert messages[0]["finish_reason"] == expected
     else:
         assert GenAIAttributes.GEN_AI_OUTPUT_MESSAGES not in attributes
 
@@ -231,6 +233,113 @@ async def test_agent_finish_reasons_handoff(
         _agent_span(span_exporter, "router"), "tool_calls", capture_content
     )
     _assert_finish_reason(_agent_span(span_exporter), "stop", capture_content)
+
+
+@pytest.mark.asyncio
+async def test_agent_finish_reasons_rejected_handoff(
+    span_exporter: InMemorySpanExporter,
+    capture_content: bool,
+) -> None:
+    agent = FunctionAgent(
+        name="member",
+        description="Handles the request and attempts a handoff.",
+        llm=_llm(
+            [
+                _tool_call(
+                    FunctionAgent,
+                    "handoff",
+                    {"to_agent": "missing", "reason": "Try another agent."},
+                ),
+                _answer(FunctionAgent),
+            ]
+        ),
+    )
+    other = FunctionAgent(
+        name="other",
+        description="Provides an alternative answer.",
+        llm=_llm([_answer(FunctionAgent)]),
+    )
+
+    result = await AgentWorkflow(
+        agents=[agent, other], root_agent="member"
+    ).run(user_msg="Answer")
+
+    assert result.response.content == "complete"
+    assert not any(
+        span.name == "invoke_agent other"
+        for span in span_exporter.get_finished_spans()
+    )
+    _assert_finish_reason(
+        _agent_span(span_exporter), "stop", capture_content
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_finish_reasons_handoff_with_return_direct_sibling(
+    span_exporter: InMemorySpanExporter,
+    capture_content: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def direct_answer() -> str:
+        return "direct answer"
+
+    original_handoff = multi_agent_workflow.handoff
+
+    async def delayed_handoff(
+        ctx: Any, to_agent: str, reason: str
+    ) -> str:
+        await asyncio.sleep(0.02)
+        return await original_handoff(ctx, to_agent, reason)
+
+    monkeypatch.setattr(multi_agent_workflow, "handoff", delayed_handoff)
+
+    router = FunctionAgent(
+        name="router",
+        description="Routes the request to another agent.",
+        can_handoff_to=["member"],
+        llm=MockFunctionCallingLLM(
+            is_chat_model=True,
+            response_generator=lambda messages, **kwargs: ChatMessage(
+                role="assistant",
+                blocks=[
+                    ToolCallBlock(
+                        tool_call_id="direct-answer",
+                        tool_name="direct_answer",
+                        tool_kwargs={},
+                    ),
+                    ToolCallBlock(
+                        tool_call_id="handoff-member",
+                        tool_name="handoff",
+                        tool_kwargs={
+                            "to_agent": "member",
+                            "reason": "Route the request.",
+                        },
+                    ),
+                ],
+            ),
+        ),
+        tools=[
+            FunctionTool.from_defaults(
+                async_fn=direct_answer,
+                name="direct_answer",
+                return_direct=True,
+            )
+        ],
+    )
+    member = FunctionAgent(
+        name="member",
+        description="Provides the requested answer.",
+        llm=_llm([_answer(FunctionAgent)]),
+    )
+
+    result = await AgentWorkflow(
+        agents=[router, member], root_agent="router"
+    ).run(user_msg="Answer")
+
+    assert result.response.content == "direct answer"
+    _assert_finish_reason(
+        _agent_span(span_exporter, "router"), "stop", capture_content
+    )
 
 
 @pytest.mark.asyncio
